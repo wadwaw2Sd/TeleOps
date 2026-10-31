@@ -1,0 +1,71 @@
+# ===== 敏感 / 隐私数据（绝对不要上传）=====
+# 本机配置（含后台口令等），仅保留 config.example.yaml
+config.yaml
+config.local.yaml
+*.local.yaml
+
+# 运行数据目录：数据库、Telegram 会话、下载的媒体、日志、窗口状态
+data/
+
+# Telethon 会话文件（账号登录凭据，泄露等于账号被接管）
+*.session
+*.session-journal
+
+# 环境变量与各类凭据
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*credentials*
+*secret*
+*token*.json
+
+# 数据库 / 日志（万一落在 data/ 之外）
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*.log
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.py.bak
+.venv/
+venv/
+env/
+/build/
+/dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ===== Electron 桌面版 =====
+node_modules/
+desktop/node_modules/
+desktop/dist/
+desktop/out/
+desktop/release/
+# 内置 Python 运行时（体积大，由 scripts/fetch-python.mjs 下载）
+# 具体规则见 desktop/.gitignore（保留 runtime/README.txt）
+
+# ===== 编辑器 / 工具 =====
+.idea/
+.vscode/
+.vs/
+*.swp
+*~
+.claude/settings.local.json
+
+# ===== 操作系统 =====
+Thumbs.db
+ehthumbs.db
+desktop.ini
+.DS_Store

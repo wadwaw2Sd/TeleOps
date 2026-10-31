@@ -1,0 +1,7 @@
+node_modules/
+dist/
+out/
+release/
+# 内置 Python 运行时体积很大，不入库，但保留说明文件
+runtime/*
+!runtime/README.txt
