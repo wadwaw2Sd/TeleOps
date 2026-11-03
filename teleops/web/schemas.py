@@ -102,6 +102,8 @@ class WorkflowIn(BaseModel):
     send_interval: float = 3.0
     dedup: bool = True
     dry_run: bool = False
+    media_cleanup: str = ""   # ""=跟随全局 / on_success / always / never
+    media_quota_mb: int = 0   # 本工作流缓存上限（MB），0=不限
     options: dict[str, Any] = Field(default_factory=dict)
     targets: list[TargetIn] = Field(default_factory=list)
 

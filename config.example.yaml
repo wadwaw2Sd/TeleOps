@@ -14,6 +14,14 @@ storage:
   media_dir: data/media
   # 下载的媒体保留天数，0 表示不清理
   media_retention_days: 3
+  # 发送成功后立刻删掉本地媒体缓存（下载模式的图片/视频用完即删）
+  # 单个工作流可在编辑页的「本地缓存清理」里单独覆盖
+  cleanup_after_send: true
+  # 投递记录（哪条内容发到过哪个目标）保留天数，0 表示永久保留
+  delivery_keep_days: 30
+  # 整个媒体目录的最大占用，0 表示不限；可写 2048（MB）或 "2GB"
+  # 超出时按最旧的文件先删；单个工作流可在编辑页的「本地缓存上限」里单独设
+  media_max_mb: 0
 
 plugins:
   # 插件搜索目录，可写多个

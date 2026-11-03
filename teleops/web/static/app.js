@@ -270,7 +270,8 @@ async function pageOverview(view) {
           <span class="node">格式化 ${d.plugins.formatter}</span><span class="arrow">→</span>
           <span class="node">输出 ${d.plugins.sink}</span>
         </div>
-        <p class="faint mt">去重记录 ${c.dedup_records} 条 · 历史累计发布 ${c.sent_total} 条
+        <p class="faint mt">去重记录 ${c.dedup_records} 条 · 投递记录 ${c.delivery_records || 0} 条
+        · 已清缓存 ${c.cache_cleaned || 0} 个文件 · 历史累计发布 ${c.sent_total} 条
         ${d.plugins.error ? `<br><span class="tag err">${d.plugins.error} 个插件加载失败</span>` : ''}</p>
       </div>
     </div>`;
@@ -441,6 +442,7 @@ async function pageWorkflows(view) {
   $$('[data-run]', view).forEach((b) => b.onclick = () => runWorkflow(+b.dataset.run, false, b));
   $$('[data-dry]', view).forEach((b) => b.onclick = () => runWorkflow(+b.dataset.dry, true, b));
   $$('[data-runs]', view).forEach((b) => b.onclick = () => showRuns(+b.dataset.runs));
+  $$('[data-deliv]', view).forEach((b) => b.onclick = () => showDeliveries(+b.dataset.deliv));
   $$('[data-del]', view).forEach((b) => b.onclick = () => {
     const wf = list.find((w) => w.id === +b.dataset.del);
     confirmBox(`删除工作流「${wf.name}」？运行记录和游标会一并清除。`, promptToast(async () => {
@@ -449,7 +451,7 @@ async function pageWorkflows(view) {
   });
   $$('[data-reset]', view).forEach((b) => b.onclick = () => {
     const id = +b.dataset.reset;
-    confirmBox('重置该工作流的采集游标和去重记录？重置后可能会重复发布已发过的内容。', promptToast(async () => {
+    confirmBox('重置该工作流的采集游标、去重记录和投递记录？重置后可能会重复发布已发过的内容。', promptToast(async () => {
       await POST(`/api/workflows/${id}/reset?mode=all`); okToast('已重置');
     }));
   });
@@ -491,6 +493,7 @@ function wfCard(w) {
       <button class="sm" data-toggle="${w.id}">${w.enabled ? '停用' : '启用'}</button>
       <button class="sm" data-edit="${w.id}">编辑</button>
       <button class="sm" data-runs="${w.id}">记录</button>
+      <button class="sm" data-deliv="${w.id}">投递</button>
       <button class="sm" data-reset="${w.id}">重置游标</button>
       <button class="sm danger" data-del="${w.id}">删除</button>
     </div>
@@ -534,15 +537,43 @@ async function showRuns(id) {
   modal({
     title: '运行记录', wide: true,
     body: rows.length ? `<div class="t-wrap"><table>
-      <thead><tr><th>时间</th><th>触发</th><th>结果</th><th>采集</th><th>保留</th><th>发布</th><th>失败</th><th>详情</th></tr></thead>
+      <thead><tr><th>时间</th><th>触发</th><th>结果</th><th>采集</th><th>保留</th><th>发布</th><th>失败</th><th>清缓存</th><th>详情</th></tr></thead>
       <tbody>${rows.map((r) => `<tr>
         <td class="nowrap faint">${fmtTime(r.started_at)}</td>
         <td><span class="tag">${r.trigger === 'manual' ? '手动' : r.trigger === 'test' ? '试运行' : '定时'}</span></td>
         <td>${STATUS_TAG[r.status] || esc(r.status)}</td>
         <td class="mono">${r.fetched}</td><td class="mono">${r.kept}</td>
         <td class="mono">${r.sent}</td><td class="mono">${r.failed || ''}</td>
+        <td class="mono faint">${r.cleaned || ''}</td>
         <td class="faint" style="max-width:280px;overflow:hidden;text-overflow:ellipsis" title="${esc(r.error || JSON.stringify(r.detail))}">${esc(r.error || '')}</td>
       </tr>`).join('')}</tbody></table></div>` : '<p class="faint">暂无运行记录</p>',
+  });
+}
+
+async function showDeliveries(id) {
+  const d = await GET(`/api/workflows/${id}/deliveries?limit=200`);
+  const rows = d.rows || [];
+  const t = d.totals || {};
+  const m = d.media || {};
+  const quota = m.quota_mb ? `${m.quota_mb} MB` : (m.global_quota_mb ? `全局 ${m.global_quota_mb} MB` : '不限');
+  modal({
+    title: '投递记录', wide: true,
+    body: `<p class="faint">记录每条内容发到过哪个目标。成功 <strong>${t.ok || 0}</strong> 条 ·
+      失败 <strong>${t.failed || 0}</strong> 条。补发时已成功的目标会自动跳过，
+      本地缓存清掉后这里会标记「已清」。<br>
+      本地缓存占用 <strong>${esc(m.usage_label || '0 B')}</strong> / 上限 ${esc(quota)}</p>
+      ${rows.length ? `<div class="t-wrap"><table>
+      <thead><tr><th>时间</th><th>内容</th><th>目标</th><th>结果</th><th>媒体</th><th>缓存</th><th>消息</th></tr></thead>
+      <tbody>${rows.map((r) => `<tr>
+        <td class="nowrap faint">${fmtTime(r.sent_at)}</td>
+        <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis" title="${esc(r.uid || r.item_key)}">${esc(r.preview || r.uid || r.item_key)}</td>
+        <td class="nowrap">${esc(r.target)}</td>
+        <td>${r.status === 'ok' ? '<span class="tag ok">成功</span>'
+            : `<span class="tag err" title="${esc(r.error)}">失败</span>`}${r.attempts > 1 ? ` <span class="faint">×${r.attempts}</span>` : ''}</td>
+        <td class="mono faint">${r.media_count || ''}</td>
+        <td class="faint">${r.cleaned ? `已清${r.cached_files ? ` ${r.cached_files} 个` : ''}` : (r.media_count ? '保留' : '—')}</td>
+        <td class="mono faint">${r.message_id || ''}</td>
+      </tr>`).join('')}</tbody></table></div>` : '<p class="faint">还没有投递记录。</p>'}`,
   });
 }
 
@@ -552,7 +583,8 @@ function workflowEditor(wf) {
     name: '', description: '', enabled: false, source_plugin: '', source_config: {},
     filters: [], formatters: [], sink_plugin: 'tg_send', sink_config: {},
     schedule_type: 'interval', schedule_value: '600', jitter: 0, account_id: null,
-    max_items_per_run: 5, send_interval: 3, dedup: true, dry_run: false, targets: [],
+    max_items_per_run: 5, send_interval: 3, dedup: true, dry_run: false,
+    media_cleanup: '', media_quota_mb: 0, targets: [],
   };
   const state = JSON.parse(JSON.stringify(w));
   if (!state.source_plugin && pluginsOf('source')[0]) state.source_plugin = pluginsOf('source')[0].name;
@@ -753,6 +785,18 @@ function wfFormHtml(s) {
           <div class="help">控制单轮节奏，避免一次刷屏</div></div>
         <div class="field"><label>发送间隔（秒）</label><input type="number" step="0.5" data-f="send_interval" data-t="float" value="${s.send_interval}">
           <div class="help">同一轮内两条之间的停顿，防限流</div></div>
+        <div class="field"><label>本地缓存清理</label>
+          <select data-f="media_cleanup" data-t="string">
+            ${[['', '跟随全局设置'], ['on_success', '发送成功后立即删除'], ['always', '发完就删（不管成败）'],
+               ['never', '保留（按全局天数清理）']].map(([v, label]) =>
+              `<option value="${v}" ${(s.media_cleanup || '') === v ? 'selected' : ''}>${label}</option>`).join('')}
+          </select>
+          <div class="help">下载模式的图片/视频会先落盘。发成功后立刻删掉，磁盘不会越用越满；<br>
+            发到哪个目标成功过都记在数据库里，补发时不会重复发</div></div>
+        <div class="field"><label>本地缓存上限（MB）</label>
+          <input type="number" min="0" data-f="media_quota_mb" data-t="int" value="${s.media_quota_mb || 0}">
+          <div class="help">0＝不限。只管本工作流的缓存目录，超了先删最旧的文件；<br>
+            本轮正要发的素材不会被删，真腾不出空间时这条会自动改走复制模式</div></div>
       </div>
     </div>
   </fieldset>`;
@@ -1353,6 +1397,10 @@ async function pageSettings(view) {
           ['单轮最多处理', sys.max_items_per_run + ' 条'],
           ['最大可等限流', sys.max_flood_wait + ' 秒'],
           ['媒体保留', sys.media_retention_days > 0 ? sys.media_retention_days + ' 天' : '用完即删'],
+          ['发完删缓存', sys.cleanup_after_send ? '开启（工作流可单独覆盖）' : '关闭'],
+          ['媒体占用上限', sys.media_max_mb > 0 ? sys.media_max_mb + ' MB（超出先删最旧的）' : '不限'],
+          ['媒体当前占用', sys.media_usage_label || '0 B'],
+          ['投递记录保留', sys.delivery_keep_days > 0 ? sys.delivery_keep_days + ' 天' : '永久'],
         ].map(([k, v]) => `<tr><td class="faint" style="width:130px">${esc(k)}</td>
              <td class="mono" style="word-break:break-all">${esc(v)}</td></tr>`).join('')}
       </tbody></table></div>

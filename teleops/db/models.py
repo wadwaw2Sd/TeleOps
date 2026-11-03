@@ -3,7 +3,7 @@
 实体关系：
     Account  1 ── n  Channel
     Workflow n ── n  Channel   （通过 WorkflowTarget，一个频道可挂载多个工作流）
-    Workflow 1 ── n  RunLog / SeenItem / WorkflowState
+    Workflow 1 ── n  RunLog / SeenItem / Delivery / WorkflowState
 """
 from __future__ import annotations
 
@@ -115,6 +115,11 @@ class Workflow(Base):
     send_interval: Mapped[float] = mapped_column(Float, default=3.0)
     dedup: Mapped[bool] = mapped_column(Boolean, default=True)
     dry_run: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 本地媒体缓存的清理策略；空=跟随全局 storage.cleanup_after_send
+    #   on_success 全部目标都发成功后删 / always 发完就删 / never 保留（按全局天数清理）
+    media_cleanup: Mapped[str] = mapped_column(String(16), default="")
+    # 本工作流媒体目录的最大占用（MB），0 表示不限；超了先删最旧的
+    media_quota_mb: Mapped[int] = mapped_column(Integer, default=0)
     options: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
     last_run_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
@@ -163,6 +168,7 @@ class RunLog(Base):
     kept: Mapped[int] = mapped_column(Integer, default=0)
     sent: Mapped[int] = mapped_column(Integer, default=0)
     failed: Mapped[int] = mapped_column(Integer, default=0)
+    cleaned: Mapped[int] = mapped_column(Integer, default=0)  # 本轮删掉的本地缓存文件数
     error: Mapped[str] = mapped_column(Text, default="")
     detail: Mapped[list[Any]] = mapped_column(JSON, default=list)
 
@@ -177,6 +183,43 @@ class SeenItem(Base):
     workflow_id: Mapped[int] = mapped_column(ForeignKey("workflows.id", ondelete="CASCADE"), index=True)
     key: Mapped[str] = mapped_column(String(255))
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class Delivery(Base):
+    """投递记录：某条内容发到过哪个目标，以及本地缓存清掉了几个文件。
+
+    和 SeenItem 的分工：SeenItem 只记"这条处理过"（工作流级），Delivery 精确到
+    每个目标。多目标里只有部分成功时，靠它能认出哪个目标已经收到过，补发时
+    不会重复打扰已发成功的频道。
+    """
+
+    __tablename__ = "deliveries"
+    __table_args__ = (
+        UniqueConstraint("workflow_id", "item_key", "channel_id", name="uq_delivery"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workflow_id: Mapped[int] = mapped_column(
+        ForeignKey("workflows.id", ondelete="CASCADE"), index=True
+    )
+    item_key: Mapped[str] = mapped_column(String(255), index=True)  # Item.fingerprint()
+    uid: Mapped[str] = mapped_column(String(255), default="")       # 源内标识，给人看
+    preview: Mapped[str] = mapped_column(String(255), default="")   # 正文摘要，方便回溯
+    # 频道被删掉后记录仍要留着，所以置空而不是级联删除
+    channel_id: Mapped[int | None] = mapped_column(
+        ForeignKey("channels.id", ondelete="SET NULL"), nullable=True
+    )
+    target_title: Mapped[str] = mapped_column(String(128), default="")
+    target_peer: Mapped[str] = mapped_column(String(128), default="")
+    status: Mapped[str] = mapped_column(String(16), default="ok")   # ok / failed
+    message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    media_count: Mapped[int] = mapped_column(Integer, default=0)
+    cached_files: Mapped[int] = mapped_column(Integer, default=0)   # 删掉的本地文件数
+    cleaned: Mapped[bool] = mapped_column(Boolean, default=False)   # 本地缓存已清理
+    attempts: Mapped[int] = mapped_column(Integer, default=1)
+    error: Mapped[str] = mapped_column(Text, default="")
+    sent_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    updated_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 class WorkflowState(Base):

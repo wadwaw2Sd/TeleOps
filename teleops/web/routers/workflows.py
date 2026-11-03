@@ -1,17 +1,27 @@
 """工作流管理：增删改查、挂载频道、手动运行、试运行、运行记录。"""
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import APIRouter, HTTPException
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import selectinload
 
+from ...core.context import dir_size, human_size
 from ...core.scheduler import parse_interval_spec
 from ...core.timing import describe_days, describe_window, parse_window
-from ...db.models import Channel, RunLog, SeenItem, Workflow, WorkflowState, WorkflowTarget
-from ..deps import DbDep, EngineDep, ok
+from ...db.models import (
+    Channel,
+    Delivery,
+    RunLog,
+    SeenItem,
+    Workflow,
+    WorkflowState,
+    WorkflowTarget,
+)
+from ..deps import DbDep, EngineDep, SettingsDep, ok
 from ..schemas import RunIn, WorkflowIn, WorkflowPatch
 
 router = APIRouter(prefix="/api/workflows", tags=["workflows"])
@@ -20,7 +30,8 @@ _SCALARS = (
     "name", "description", "enabled", "source_plugin", "source_config",
     "sink_plugin", "sink_config", "schedule_type", "schedule_value", "jitter",
     "active_hours", "active_days", "daily_limit", "timezone",
-    "account_id", "max_items_per_run", "send_interval", "dedup", "dry_run", "options",
+    "account_id", "max_items_per_run", "send_interval", "dedup", "dry_run",
+    "media_cleanup", "media_quota_mb", "options",
 )
 
 
@@ -51,6 +62,8 @@ def _dump(wf: Workflow, channels: dict[int, Channel], engine=None) -> dict[str, 
         "send_interval": wf.send_interval,
         "dedup": wf.dedup,
         "dry_run": wf.dry_run,
+        "media_cleanup": wf.media_cleanup or "",
+        "media_quota_mb": wf.media_quota_mb or 0,
         "options": wf.options or {},
         "last_run_at": wf.last_run_at.isoformat() if wf.last_run_at else None,
         "last_status": wf.last_status,
@@ -142,7 +155,7 @@ async def delete_workflow(workflow_id: int, db: DbDep, engine: EngineDep):
     wf = await _need(db, workflow_id)
     engine.scheduler.remove(workflow_id)
     # 显式清干净附属数据：id 会被后建的工作流复用，留下孤儿记录会串档
-    for model in (RunLog, SeenItem, WorkflowState, WorkflowTarget):
+    for model in (RunLog, SeenItem, Delivery, WorkflowState, WorkflowTarget):
         await db.execute(delete(model).where(model.workflow_id == workflow_id))
     await db.delete(wf)
     return ok()
@@ -190,6 +203,7 @@ async def runs(workflow_id: int, db: DbDep, limit: int = 30):
                 "kept": r.kept,
                 "sent": r.sent,
                 "failed": r.failed,
+                "cleaned": r.cleaned or 0,
                 "error": r.error,
                 "detail": r.detail or [],
             }
@@ -198,14 +212,73 @@ async def runs(workflow_id: int, db: DbDep, limit: int = 30):
     )
 
 
+@router.get("/{workflow_id}/deliveries")
+async def deliveries(
+    workflow_id: int, db: DbDep, settings: SettingsDep, limit: int = 100, status: str | None = None
+):
+    """投递记录：哪条内容发到过哪个目标、缓存清没清。"""
+    stmt = select(Delivery).where(Delivery.workflow_id == workflow_id)
+    if status in ("ok", "failed"):
+        stmt = stmt.where(Delivery.status == status)
+    rows = (
+        await db.execute(stmt.order_by(Delivery.sent_at.desc(), Delivery.id.desc()).limit(limit))
+    ).scalars().all()
+    totals = (
+        await db.execute(
+            select(Delivery.status, func.count(Delivery.id))
+            .where(Delivery.workflow_id == workflow_id)
+            .group_by(Delivery.status)
+        )
+    ).all()
+    wf = await _need(db, workflow_id)
+    media_dir = settings.storage.media_dir / f"wf_{workflow_id}"
+    usage = await asyncio.to_thread(dir_size, media_dir)
+    return ok(
+        {
+            "totals": {str(k): int(v) for k, v in totals},
+            "media": {
+                "dir": str(media_dir),
+                "usage": usage,
+                "usage_label": human_size(usage),
+                "quota_mb": wf.media_quota_mb or 0,
+                "global_quota_mb": settings.storage.media_max_mb,
+                "cleanup": wf.media_cleanup or "",
+            },
+            "rows": [
+                {
+                    "id": r.id,
+                    "item_key": r.item_key,
+                    "uid": r.uid or "",
+                    "preview": r.preview or "",
+                    "channel_id": r.channel_id,
+                    "target": r.target_title or r.target_peer or "(已删除)",
+                    "peer": r.target_peer or "",
+                    "status": r.status,
+                    "message_id": r.message_id,
+                    "media_count": r.media_count or 0,
+                    "cleaned": bool(r.cleaned),
+                    "cached_files": r.cached_files or 0,
+                    "attempts": r.attempts or 1,
+                    "error": r.error or "",
+                    "sent_at": r.sent_at.isoformat() if r.sent_at else None,
+                }
+                for r in rows
+            ],
+        }
+    )
+
+
 @router.post("/{workflow_id}/reset")
 async def reset_state(workflow_id: int, db: DbDep, mode: str = "all"):
-    """重置游标 / 去重记录。mode: all | cursor | dedup"""
+    """重置游标 / 去重记录 / 投递记录。mode: all | cursor | dedup | deliveries"""
     await _need(db, workflow_id)
     if mode in ("all", "cursor"):
         await db.execute(delete(WorkflowState).where(WorkflowState.workflow_id == workflow_id))
     if mode in ("all", "dedup"):
         await db.execute(delete(SeenItem).where(SeenItem.workflow_id == workflow_id))
+    if mode in ("all", "dedup", "deliveries"):
+        # 去重记录清了却留着投递记录，补发会被"已投递过"挡住，必须一起清
+        await db.execute(delete(Delivery).where(Delivery.workflow_id == workflow_id))
     return ok({"mode": mode})
 
 
@@ -217,9 +290,20 @@ async def get_state(workflow_id: int, db: DbDep):
     seen = (
         await db.execute(select(SeenItem.id).where(SeenItem.workflow_id == workflow_id))
     ).all()
+    counts = dict(
+        (
+            await db.execute(
+                select(Delivery.status, func.count(Delivery.id))
+                .where(Delivery.workflow_id == workflow_id)
+                .group_by(Delivery.status)
+            )
+        ).all()
+    )
     return ok({
         "state": {r.key: (r.value or {}).get("v") for r in rows},
         "seen_count": len(seen),
+        "delivered_count": int(counts.get("ok", 0)),
+        "delivery_failed_count": int(counts.get("failed", 0)),
     })
 
 

@@ -45,6 +45,7 @@ class Engine:
         if self.settings.plugins.auto_reload:
             self._watch_task = asyncio.create_task(self._watch_plugins())
         await self._cleanup_media()
+        await self._cleanup_deliveries()
         self._cleanup_tmp()
         log.info("TeleOps 引擎已启动")
 
@@ -106,14 +107,21 @@ class Engine:
         """
         from sqlalchemy import delete, select
 
-        from ..db.models import RunLog, SeenItem, Workflow, WorkflowState, WorkflowTarget
+        from ..db.models import (
+            Delivery,
+            RunLog,
+            SeenItem,
+            Workflow,
+            WorkflowState,
+            WorkflowTarget,
+        )
         from ..db.session import session_scope
 
         try:
             async with session_scope() as s:
                 alive = set((await s.execute(select(Workflow.id))).scalars().all())
                 total = 0
-                for model in (RunLog, SeenItem, WorkflowState, WorkflowTarget):
+                for model in (RunLog, SeenItem, Delivery, WorkflowState, WorkflowTarget):
                     stmt = delete(model)
                     stmt = stmt.where(model.workflow_id.notin_(alive)) if alive else stmt
                     total += (await s.execute(stmt)).rowcount or 0
@@ -141,20 +149,52 @@ class Engine:
 
     async def _cleanup_media(self) -> None:
         days = self.settings.storage.media_retention_days
+        removed = 0
+        if days > 0:
+            cutoff = time.time() - days * 86400
+            for p in self.settings.storage.media_dir.rglob("*"):
+                if p.is_file():
+                    try:
+                        if p.stat().st_mtime < cutoff:
+                            p.unlink()
+                            removed += 1
+                    except OSError:
+                        pass
+            if removed:
+                log.info("清理过期媒体文件 %d 个", removed)
+
+        # 再按占用上限裁一刀（启动时没有正在发送的内容，可以放心删最旧的）
+        limit_mb = self.settings.storage.media_max_mb
+        if limit_mb > 0:
+            from .context import human_size, trim_dir
+
+            files, freed = await asyncio.to_thread(
+                trim_dir, self.settings.storage.media_dir, limit_mb * 1024 * 1024, None
+            )
+            if files:
+                log.info("媒体目录超出 %d MB 上限，已删除最旧的 %d 个文件（释放 %s）",
+                         limit_mb, files, human_size(freed))
+
+    async def _cleanup_deliveries(self) -> None:
+        """按保留天数裁剪投递记录，免得库无限长大。"""
+        days = self.settings.storage.delivery_keep_days
         if days <= 0:
             return
-        cutoff = time.time() - days * 86400
-        removed = 0
-        for p in self.settings.storage.media_dir.rglob("*"):
-            if p.is_file():
-                try:
-                    if p.stat().st_mtime < cutoff:
-                        p.unlink()
-                        removed += 1
-                except OSError:
-                    pass
-        if removed:
-            log.info("清理过期媒体文件 %d 个", removed)
+        import datetime as _dt
+
+        from sqlalchemy import delete
+
+        from ..db.models import Delivery
+        from ..db.session import session_scope
+
+        cutoff = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=days)
+        try:
+            async with session_scope() as s:
+                n = (await s.execute(delete(Delivery).where(Delivery.sent_at < cutoff))).rowcount or 0
+            if n:
+                log.info("清理过期投递记录 %d 条", n)
+        except Exception as e:
+            log.warning("清理投递记录失败：%s", e)
 
     def status(self) -> dict[str, Any]:
         return {

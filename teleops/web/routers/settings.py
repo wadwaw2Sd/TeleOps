@@ -1,6 +1,7 @@
 """设置：全局 Telegram API 凭据 + 只读的系统信息。"""
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -8,6 +9,7 @@ from fastapi import APIRouter, HTTPException
 from sqlalchemy import func, select
 
 from ...core.appconfig import save_telegram_api
+from ...core.context import dir_size, human_size
 from ...db.models import Account
 from ..deps import DbDep, EngineDep, SettingsDep, ok
 from ..schemas import TelegramApiIn
@@ -19,6 +21,7 @@ log = logging.getLogger(__name__)
 @router.get("")
 async def read_settings(db: DbDep, engine: EngineDep, settings: SettingsDep):
     api = engine.tg_api
+    media_usage = await asyncio.to_thread(dir_size, settings.storage.media_dir)
     total = (await db.execute(select(func.count(Account.id)))).scalar_one()
     online = (
         await db.execute(select(func.count(Account.id)).where(Account.status == "online"))
@@ -39,6 +42,11 @@ async def read_settings(db: DbDep, engine: EngineDep, settings: SettingsDep):
                 "max_items_per_run": settings.runtime.max_items_per_run,
                 "max_flood_wait": settings.runtime.max_flood_wait,
                 "media_retention_days": settings.storage.media_retention_days,
+                "cleanup_after_send": settings.storage.cleanup_after_send,
+                "delivery_keep_days": settings.storage.delivery_keep_days,
+                "media_max_mb": settings.storage.media_max_mb,
+                "media_usage": media_usage,
+                "media_usage_label": human_size(media_usage),
                 "auto_reload": settings.plugins.auto_reload,
             },
         }

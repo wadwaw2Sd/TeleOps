@@ -7,7 +7,7 @@ from typing import Any
 from fastapi import APIRouter
 from sqlalchemy import func, select
 
-from ...db.models import Account, Channel, RunLog, SeenItem, Workflow
+from ...db.models import Account, Channel, Delivery, RunLog, SeenItem, Workflow
 from ...logging_setup import recent_logs
 from ..deps import DbDep, EngineDep, SettingsDep, ok
 
@@ -32,6 +32,10 @@ async def overview(db: DbDep, engine: EngineDep):
     ).one()
     total_sent = (await db.execute(select(func.coalesce(func.sum(Workflow.total_sent), 0)))).scalar_one()
     seen_total = (await db.execute(select(func.count(SeenItem.id)))).scalar_one()
+    deliv_total = (await db.execute(select(func.count(Delivery.id)))).scalar_one()
+    cache_freed = (
+        await db.execute(select(func.coalesce(func.sum(Delivery.cached_files), 0)))
+    ).scalar_one()
 
     recent = (
         await db.execute(select(RunLog).order_by(RunLog.id.desc()).limit(15))
@@ -52,6 +56,8 @@ async def overview(db: DbDep, engine: EngineDep):
                 "failed_24h": int(day_rows[2] or 0),
                 "sent_total": int(total_sent or 0),
                 "dedup_records": int(seen_total or 0),
+                "delivery_records": int(deliv_total or 0),
+                "cache_cleaned": int(cache_freed or 0),
             },
             "plugins": engine.registry.stats(),
             "jobs": engine.scheduler.jobs()[:10],
@@ -99,6 +105,7 @@ async def system(engine: EngineDep, settings: SettingsDep):
         "send_interval": settings.runtime.send_interval,
         "max_items_per_run": settings.runtime.max_items_per_run,
         "media_dir": str(settings.storage.media_dir),
+        "cleanup_after_send": settings.storage.cleanup_after_send,
         "auto_reload": settings.plugins.auto_reload,
         "auth_enabled": bool(settings.server.auth_token),
     }

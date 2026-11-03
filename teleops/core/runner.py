@@ -33,6 +33,8 @@ class RunResult:
     kept: int = 0
     sent: int = 0
     failed: int = 0
+    cleaned: int = 0            # 发送后删掉的本地缓存文件数
+    trimmed: int = 0            # 超出占用上限被裁掉的旧文件数
     error: str = ""
     detail: list[dict[str, Any]] = field(default_factory=list)
     items: list[dict[str, Any]] = field(default_factory=list)  # dry-run 预览用
@@ -46,6 +48,8 @@ class RunResult:
             "kept": self.kept,
             "sent": self.sent,
             "failed": self.failed,
+            "cleaned": self.cleaned,
+            "trimmed": self.trimmed,
             "error": self.error,
             "detail": self.detail,
             "items": self.items,
@@ -151,6 +155,10 @@ class WorkflowRunner:
                 await p.setup(ctx)
 
             # ---- 采集 ----
+            # 先把上一轮残留的缓存压回配额内，给本轮的下载腾地方
+            n, _ = await ctx.enforce_media_quota(protect_current_run=False)
+            result.trimmed += n
+
             items = await source.fetch(ctx)
             result.fetched = len(items)
             ctx.log.info("采集到 %d 条", len(items))
@@ -192,34 +200,69 @@ class WorkflowRunner:
 
             # ---- 输出 ----
             interval = wf.send_interval or self.settings.runtime.send_interval
+            policy = cleanup_policy(wf, self.settings)
             for idx, it in enumerate(items):
-                ok_any = False
+                key = it.fingerprint()
+                # 投递记录里已经成功的目标直接跳过：多目标里只有一个失败时，
+                # 下一轮补发不会再骚扰已经收到的频道
+                done = (
+                    await ctx.delivered_channels(key)
+                    if wf.dedup and not effective_dry
+                    else set()  # 关掉去重＝用户就是要重复发，别拿投递记录挡他
+                )
+                ok_n = fail_n = skip_n = 0
                 for target in targets:
+                    if target.channel_id in done:
+                        skip_n += 1
+                        ctx.log.info("「%s」已投递过，跳过", target.title)
+                        result.detail.append(
+                            {"uid": it.uid, "target": target.title, "ok": True, "skipped": "已投递过"}
+                        )
+                        continue
                     try:
                         if effective_dry:
                             ctx.log.info("[试运行] -> %s：%s", target.title, it.preview())
-                            ok_any = True
+                            ok_n += 1
                         else:
                             info = await sink.send(it, target, ctx)
-                            ok_any = True
+                            ok_n += 1
                             result.detail.append(
                                 {"uid": it.uid, "target": target.title, "ok": True, **(info or {})}
                             )
+                            await ctx.record_delivery(
+                                it, target, status="ok", message_id=(info or {}).get("message_id")
+                            )
                     except Exception as e:
+                        fail_n += 1
                         result.failed += 1
+                        err = f"{type(e).__name__}: {e}"
                         result.detail.append(
-                            {"uid": it.uid, "target": target.title, "ok": False, "error": f"{type(e).__name__}: {e}"}
+                            {"uid": it.uid, "target": target.title, "ok": False, "error": err}
                         )
                         ctx.log.error("发送到 %s 失败：%s", target.title, e)
-                if ok_any:
+                        await ctx.record_delivery(it, target, status="failed", error=err)
+                if ok_n:
                     result.sent += 1
                     ctx.sent_items.append(it)
-                    if wf.dedup:
-                        await ctx.mark_seen(it.fingerprint())
+                # 有目标失败就先不记"已处理"：下一轮还能回来补发，
+                # 已经成功的目标靠上面的投递记录跳过，不会重复发
+                if wf.dedup and (ok_n or skip_n) and not fail_n:
+                    await ctx.mark_seen(key)
+                # ---- 发完就删：把下载到本地的图片/视频清掉 ----
+                if not effective_dry and should_cleanup(policy, ok_n, fail_n, skip_n):
+                    gone = await ctx.cleanup_item_media(it)
+                    if gone:
+                        result.cleaned += gone
+                        await ctx.mark_cleaned(key, gone)
                 if effective_dry:
                     result.items.append(it.to_dict())
                 if interval and idx < len(items) - 1:
                     await asyncio.sleep(interval)
+
+            # 收尾再压一次配额：本轮留着等重试的素材不动（见 enforce_media_quota）
+            if not effective_dry:
+                n, _ = await ctx.enforce_media_quota()
+                result.trimmed += n
 
             # 提交游标：只对确实发出去的内容推进，失败的下轮重试
             if not effective_dry:
@@ -361,6 +404,7 @@ class WorkflowRunner:
             row.kept = result.kept
             row.sent = result.sent
             row.failed = result.failed
+            row.cleaned = result.cleaned
             row.error = result.error[:2000]
             row.detail = result.detail[-50:]
             # 保留条数上限
@@ -389,6 +433,27 @@ class WorkflowRunner:
             wf.total_runs = (wf.total_runs or 0) + 1
             if count_sent:  # 试运行没有真的发出去，不计入累计
                 wf.total_sent = (wf.total_sent or 0) + result.sent
+
+
+CLEANUP_MODES = ("on_success", "always", "never")
+
+
+def cleanup_policy(wf: Workflow, settings: Settings) -> str:
+    """工作流的缓存清理策略；留空则跟随全局开关。"""
+    mode = (wf.media_cleanup or "").strip()
+    if mode in CLEANUP_MODES:
+        return mode
+    return "on_success" if settings.storage.cleanup_after_send else "never"
+
+
+def should_cleanup(policy: str, ok_n: int, fail_n: int, skip_n: int) -> bool:
+    """这一条的本地缓存现在能不能删。"""
+    if policy == "never" or not (ok_n or fail_n or skip_n):
+        return False
+    if policy == "always":
+        return True
+    # on_success：留着失败目标的素材，下一轮还要用它补发
+    return bool(ok_n or skip_n) and not fail_n
 
 
 def humanize(delta: dt.timedelta) -> str:

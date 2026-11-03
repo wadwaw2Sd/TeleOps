@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,28 @@ def _abs(base: Path, p: str | os.PathLike[str]) -> Path:
     return path if path.is_absolute() else (base / path)
 
 
+def parse_size_mb(value: Any) -> int:
+    """把 2048 / "2048" / "2GB" / "500m" / "1.5 GB" 统一成 MB 整数。
+
+    纯数字按 MB 理解（配置项名字里带 _mb）；认不出来的写法当成不限制，
+    免得一个笔误把整个媒体目录清空。
+    """
+    if value is None or value == "":
+        return 0
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    text = str(value).strip().lower().replace(" ", "")
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)(b|k|kb|m|mb|g|gb|t|tb)?", text)
+    if not m:
+        return 0
+    num = float(m.group(1))
+    unit = (m.group(2) or "mb").rstrip("b") or "m"
+    factor = {"": 1.0, "b": 1.0 / (1024 * 1024), "k": 1.0 / 1024, "m": 1.0, "g": 1024.0, "t": 1024.0 * 1024}
+    mb = int(num * factor.get(unit, 1.0))
+    # 写了个不到 1MB 的上限也是想限制，别四舍五入成"不限"
+    return max(1, mb) if num > 0 else 0
+
+
 @dataclass
 class ServerConfig:
     host: str = "127.0.0.1"
@@ -49,6 +72,12 @@ class StorageConfig:
     database_url: str = "sqlite+aiosqlite:///data/teleops.db"
     media_dir: Path = ROOT / "data" / "media"
     media_retention_days: int = 3
+    # 发送成功后立刻删掉本地媒体缓存（工作流可单独覆盖）
+    cleanup_after_send: bool = True
+    # 投递记录保留天数，0 表示永久保留
+    delivery_keep_days: int = 30
+    # 整个媒体目录的最大占用（MB），0 表示不限；超出时按最旧的文件先删
+    media_max_mb: int = 0
 
 
 @dataclass
@@ -119,6 +148,9 @@ def load_settings(path: str | os.PathLike[str] | None = None) -> Settings:
         database_url=db_url,
         media_dir=_abs(ROOT, st.get("media_dir", data_dir / "media")),
         media_retention_days=int(st.get("media_retention_days", 3)),
+        cleanup_after_send=bool(st.get("cleanup_after_send", True)),
+        delivery_keep_days=int(st.get("delivery_keep_days", 30)),
+        media_max_mb=parse_size_mb(st.get("media_max_mb", st.get("media_max_size", 0))),
     )
 
     pl = raw.get("plugins") or {}

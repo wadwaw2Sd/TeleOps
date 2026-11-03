@@ -59,7 +59,7 @@ def split_chats(raw: str) -> list[str]:
 class TgChannelSource(SourcePlugin):
     name = "tg_channel"
     display_name = "TG 频道搬运"
-    version = "1.3.0"
+    version = "1.4.0"
     author = "TeleOps"
     description = ("抓取一个或多个 Telegram 频道的消息，支持增量 / 从头开始 / 随机三种模式，"
                    "媒体可复制或下载后重发。每个源频道的进度独立记录。")
@@ -421,6 +421,16 @@ class TgChannelSource(SourcePlugin):
                         )
                     )
                 else:  # download
+                    if await self._out_of_space(ctx, m):
+                        # 本地没地方了，这条退回复制模式：内容照发，只是不落盘
+                        media.append(
+                            Media(
+                                kind=kind,
+                                tg_ref={"account_id": account_id, "chat": str(chat), "msg_id": m.id},
+                                spoiler=bool(getattr(mm, "spoiler", False)),
+                            )
+                        )
+                        continue
                     path = await client.download_media(m, file=str(ctx.media_dir()))
                     if path:
                         media.append(Media(kind=kind, path=str(path),
@@ -464,6 +474,20 @@ class TgChannelSource(SourcePlugin):
             meta={"plain_text": plain, "media_mode": media_mode, "source_chat": chat_raw},
         )
         return item
+
+    async def _out_of_space(self, ctx, msg) -> bool:
+        """下载前看一眼本地缓存配额；超了先裁旧文件，还是不够就返回 True。"""
+        if not ctx.has_media_limit():
+            return False
+        need = int(getattr(getattr(msg, "document", None), "size", 0) or 0) or 1
+        left = await ctx.media_budget_left()
+        if left is not None and left < need:
+            await ctx.enforce_media_quota()
+            left = await ctx.media_budget_left()
+        if left is not None and left < need:
+            ctx.log.warning("本地缓存已达上限，这条媒体改用复制模式（不落盘）")
+            return True
+        return False
 
     # ------------------------------------------------------------- 游标推进
     async def _commit_cursors(self, ctx) -> None:
